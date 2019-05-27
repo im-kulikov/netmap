@@ -252,7 +252,7 @@ func TestBucket_GetSelection(t *testing.T) {
 
 	buckets = []bucket{
 		{"/Location:Europe/Country:Germany/City:Hamburg", []uint32{25}},
-		{"/Location:Europe/Country:Spain/City:Madrid", []uint32{17, 18}},
+		{"/Location:Europe/Country:Spain/City:Barcelona", []uint32{26, 30}},
 	}
 
 	exp, err = newRoot(buckets...)
@@ -267,7 +267,7 @@ func TestBucket_GetSelection(t *testing.T) {
 	g.Expect(r.nodes).To(Equal(exp.nodes))
 
 	buckets = []bucket{
-		{"/Location:Europe/Country:Spain/City:Madrid", []uint32{17, 18}},
+		{"/Location:Europe/Country:Spain/City:Barcelona", []uint32{26, 30}},
 		{"/Location:NorthAmerica/Country:USA/City:NewYork", []uint32{19, 20}},
 	}
 	exp, err = newRoot(buckets...)
@@ -577,7 +577,6 @@ func TestBucket_Nodelist(t *testing.T) {
 
 func TestNetMap_FindGraph(t *testing.T) {
 	var (
-		ns         []uint32
 		nodesByLoc map[string][]uint32
 		root, exp  Bucket
 		c          *Bucket
@@ -692,7 +691,7 @@ func TestNetMap_FindGraph(t *testing.T) {
 	}
 	c = root.FindGraph(nil, SFGroup{Selectors: ss, Filters: fs})
 	g.Expect(c).To(Equal(&exp))
-	for _, n := range ns {
+	for _, n := range c.Nodelist() {
 		g.Expect(nodesByLoc["NorthAmerica"]).To(ContainElement(n))
 	}
 
@@ -966,7 +965,6 @@ func Benchmark_MarshalStress(b *testing.B) {
 		err := after.UnmarshalBinary(data)
 		if err != nil {
 			b.Fatal(err)
-			b.FailNow()
 		}
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
-	"sort"
 	"strings"
 
 	"github.com/nspcc-dev/hrw"
@@ -33,13 +32,19 @@ type (
 		Value    string
 		nodes    Uint32Slice
 		children []Bucket
+		weights  []uint64
 	}
 
 	// Uint32Slice is generic type for more convenient sorting.
 	Uint32Slice []uint32
 
 	// FilterFunc is generic type for filtering function on nodes.
-	FilterFunc func([]uint32) []uint32
+	FilterFunc func([]uint32, []uint64) ([]uint32, []uint64)
+
+	Node struct {
+		N uint32
+		W uint64
+	}
 )
 
 func (p Uint32Slice) Len() int           { return len(p) }
@@ -74,21 +79,23 @@ func (b *Bucket) findGraph(pivot []byte, s SFGroup) (c *Bucket) {
 
 // FindNodes returns list of nodes, corresponding to specified placement rule.
 func (b *Bucket) FindNodes(pivot []byte, ss ...SFGroup) (nodes []uint32) {
+	var w []uint64
 	for _, s := range ss {
-		nodes = merge(nodes, b.findNodes(pivot, s))
+		fn, fw := b.findNodes(pivot, s)
+		nodes, w = merge(nodes, fn, w, fw)
 	}
 	return
 }
 
-func (b *Bucket) findNodes(pivot []byte, s SFGroup) []uint32 {
+func (b *Bucket) findNodes(pivot []byte, s SFGroup) ([]uint32, []uint64) {
 	var c *Bucket
 
 	if c = b.GetMaxSelection(s); c != nil {
 		if c = c.GetSelection(s.Selectors, pivot); c != nil {
-			return c.Nodelist()
+			return c.nodelist()
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // Copy returns deep copy of Bucket.
@@ -116,8 +123,9 @@ func (b Bucket) Copy() Bucket {
 // - there must be no nodes belonging to 2 buckets
 func (b Bucket) IsValid() bool {
 	var (
-		ns    Uint32Slice
-		nodes = make(Uint32Slice, 0, len(b.nodes))
+		ns      Uint32Slice
+		nodes   = make(Uint32Slice, 0, len(b.nodes))
+		weights = make([]uint64, 0, len(b.nodes))
 	)
 
 	if len(b.children) == 0 {
@@ -129,9 +137,11 @@ func (b Bucket) IsValid() bool {
 			return false
 		}
 		nodes = append(nodes, c.nodes...)
+		weights = append(weights, c.weights...)
+
 	}
 
-	sort.Sort(nodes)
+	strawSort(nodes, weights)
 	ns = intersect(nodes, b.nodes)
 	return len(nodes) == len(ns)
 }
@@ -163,7 +173,7 @@ func (b Bucket) filterSubtree(filter FilterFunc) *Bucket {
 	root.Value = b.Value
 	if len(b.children) == 0 {
 		if filter != nil {
-			root.nodes = filter(b.nodes)
+			root.nodes, root.weights = filter(b.nodes, b.weights)
 		} else {
 			root.nodes = b.nodes
 		}
@@ -175,12 +185,12 @@ func (b Bucket) filterSubtree(filter FilterFunc) *Bucket {
 
 	for _, c := range b.children {
 		if r = c.filterSubtree(filter); r != nil {
-			root.nodes = merge(root.nodes, r.nodes)
+			root.nodes, root.weights = merge(root.nodes, r.nodes, root.weights, r.weights)
 			root.children = append(root.children, *r)
 		}
 	}
 	if len(root.nodes) > 0 {
-		sort.Sort(root.nodes)
+		strawSort(root.nodes, root.weights)
 		return &root
 	}
 	return nil
@@ -217,7 +227,9 @@ func (b Bucket) getMaxSelectionC(ss []Select, filter FilterFunc, cut bool) (*Buc
 		}
 		if r, n = c.getMaxSelectionC(sel, filter, cutc); r != nil {
 			root.children = append(root.children, *r)
-			root.nodes = append(root.nodes, r.Nodelist()...)
+			rn, rw := r.nodelist()
+			root.nodes = append(root.nodes, rn...)
+			root.weights = append(root.weights, rw...)
 			if cutc {
 				count++
 			} else {
@@ -227,7 +239,7 @@ func (b Bucket) getMaxSelectionC(ss []Select, filter FilterFunc, cut bool) (*Buc
 	}
 
 	if (!cut && count != 0) || count >= ss[0].Count {
-		sort.Sort(root.nodes)
+		strawSort(root.nodes, root.weights)
 		return &root, count
 
 	}
@@ -249,8 +261,8 @@ func (b Bucket) GetMaxSelection(s SFGroup) (r *Bucket) {
 		excludes[c] = struct{}{}
 	}
 
-	r, _ = b.getMaxSelection(s.Selectors, func(nodes []uint32) []uint32 {
-		return diff(nodes, excludes)
+	r, _ = b.getMaxSelection(s.Selectors, func(nodes []uint32, weight []uint64) ([]uint32, []uint64) {
+		return diff(nodes, excludes, weight)
 	})
 	return
 }
@@ -271,6 +283,7 @@ func (b Bucket) GetSelection(ss []Select, pivot []byte) *Bucket {
 
 	if len(ss) == 0 {
 		root.nodes = b.nodes
+		root.weights = b.weights
 		root.children = b.children
 		return &root
 	}
@@ -282,11 +295,14 @@ func (b Bucket) GetSelection(ss []Select, pivot []byte) *Bucket {
 		}
 
 		nodes := make([]uint32, len(b.nodes))
+		weights := make([]uint64, len(b.nodes))
 		copy(nodes, b.nodes)
+		copy(weights, b.weights)
 		if len(pivot) != 0 {
-			hrw.SortSliceByValue(nodes, pivotHash)
+			hrw.SortSliceByWeightValue(nodes, weights, pivotHash)
 		}
 		root.nodes = nodes[:count]
+		root.weights = weights[:count]
 		return &root
 	}
 
@@ -318,6 +334,7 @@ func (b Bucket) combine(b1 *Bucket) *Bucket {
 				Value:    b.Value,
 				nodes:    r.nodes,
 				children: []Bucket{*r},
+				weights:  r.weights,
 			}
 		}
 	}
@@ -352,7 +369,7 @@ func (b Bucket) CheckConflicts(b1 Bucket) bool {
 
 // Merge merges b1 into b assuming there are no conflicts.
 func (b *Bucket) Merge(b1 Bucket) {
-	b.nodes = merge(b.nodes, b1.nodes)
+	b.nodes, b.weights = merge(b.nodes, b1.nodes, b.weights, b1.weights)
 
 loop:
 	for _, c1 := range b1.children {
@@ -364,30 +381,34 @@ loop:
 		}
 		b.children = append(b.children, c1)
 	}
-	sort.Sort(b.nodes)
+	strawSort(b.nodes, b.weights)
 }
 
 // UpdateIndices is auxiliary function used to update
 // indices of all nodes according to tr.
-func (b *Bucket) UpdateIndices(tr map[uint32]uint32) Bucket {
+func (b *Bucket) UpdateIndices(tr map[uint32]Node) Bucket {
 	var (
 		children = make([]Bucket, 0, len(b.children))
 		nodes    = make(Uint32Slice, 0, len(b.nodes))
+		weights  = make([]uint64, 0, len(b.weights))
 	)
 
 	for i := range b.children {
 		children = append(children, b.children[i].UpdateIndices(tr))
 	}
 	for i := range b.nodes {
-		nodes = append(nodes, tr[b.nodes[i]])
+		nodes = append(nodes, tr[b.nodes[i]].N)
+		weights = append(weights, tr[b.nodes[i]].W)
 	}
-	sort.Sort(nodes)
+
+	strawSort(nodes, weights)
 
 	return Bucket{
 		Key:      b.Key,
 		Value:    b.Value,
 		children: children,
 		nodes:    nodes,
+		weights:  weights,
 	}
 }
 
@@ -421,6 +442,9 @@ func (b Bucket) Write(w io.Writer) error {
 		return err
 	}
 	if err = binary.Write(w, binary.BigEndian, b.nodes); err != nil {
+		return err
+	}
+	if err = binary.Write(w, binary.BigEndian, b.weights); err != nil {
 		return err
 	}
 
@@ -462,6 +486,10 @@ func (b *Bucket) Read(r io.Reader) error {
 	if ln > 0 {
 		b.nodes = make([]uint32, ln)
 		if err = binary.Read(r, binary.BigEndian, &b.nodes); err != nil {
+			return err
+		}
+		b.weights = make([]uint64, ln)
+		if err = binary.Read(r, binary.BigEndian, &b.weights); err != nil {
 			return err
 		}
 	}
@@ -506,21 +534,30 @@ func (b Bucket) Name() string {
 
 func (b *Bucket) fillNodes() {
 	r := b.nodes
+	w := b.weights
 	for _, c := range b.children {
 		c.fillNodes()
-		r = merge(r, c.Nodelist())
+		cn, cw := c.nodelist()
+		r, w = merge(r, cn, w, cw)
 	}
 	b.nodes = r
+	b.weights = w
 }
 
 // Nodelist returns slice of nodes belonging to b.
 func (b Bucket) Nodelist() (r []uint32) {
+	r, _ = b.nodelist()
+	return r
+}
+
+func (b Bucket) nodelist() (r []uint32, w []uint64) {
 	if b.nodes != nil || len(b.children) == 0 {
-		return b.nodes
+		return b.nodes, b.weights
 	}
 
 	for _, c := range b.children {
-		r = merge(r, c.Nodelist())
+		cn, cw := c.nodelist()
+		r, w = merge(r, cn, w, cw)
 	}
 	return
 }
@@ -557,18 +594,18 @@ func (b Bucket) GetNodesByOption(opts ...string) []uint32 {
 	return nodes
 }
 
-func (b *Bucket) addNodes(bs []Bucket, n []uint32) error {
-	b.nodes = merge(b.nodes, n)
+func (b *Bucket) addNodes(bs []Bucket, n []uint32, w []uint64) error {
+	b.nodes, b.weights = merge(b.nodes, n, b.weights, w)
 	if len(bs) == 0 {
 		return nil
 	}
 
 	for i := range b.children {
 		if bs[0].Equals(b.children[i]) {
-			return b.children[i].addNodes(bs[1:], n)
+			return b.children[i].addNodes(bs[1:], n, w)
 		}
 	}
-	b.children = append(b.children, makeTreeProps(bs, n))
+	b.children = append(b.children, makeTreeProps(bs, n, w))
 	return nil
 }
 
@@ -577,13 +614,24 @@ func (b *Bucket) AddBucket(o string, n []uint32) error {
 	if o != Separator && (!strings.HasPrefix(o, Separator) || strings.HasSuffix(o, Separator)) {
 		return errors.Errorf("must start and not end with '%s'", Separator)
 	}
+	var w []uint64
+	if len(n) > 0 {
+		w = make([]uint64, len(n))
+	}
+	return b.addNodes(splitProps(o[1:]), n, w)
+}
 
-	return b.addNodes(splitProps(o[1:]), n)
+func (b *Bucket) AddStrawBucket(o string, n []uint32, w []uint64) error {
+	if o != Separator && (!strings.HasPrefix(o, Separator) || strings.HasSuffix(o, Separator)) {
+		return errors.Errorf("must start and not end with '%s'", Separator)
+	}
+
+	return b.addNodes(splitProps(o[1:]), n, w)
 }
 
 // AddChild adds c as direct child to b.
 func (b *Bucket) AddChild(c Bucket) {
-	b.nodes = merge(b.nodes, c.nodes)
+	b.nodes, b.weights = merge(b.nodes, c.nodes, b.weights, c.weights)
 	b.children = append(b.children, c)
 }
 
@@ -597,42 +645,49 @@ func splitProps(o string) []Bucket {
 	return props
 }
 
-func merge(a, b []uint32) []uint32 {
+func merge(a, b []uint32, wa, wb []uint64) ([]uint32, []uint64) {
 	if a == nil {
-		return b
+		return b, wb
 	}
 
 	la, lb := len(a), len(b)
 	c := make([]uint32, 0, la+lb)
+	wc := make([]uint64, 0, la+lb)
 loop:
 	for i, j := 0, 0; i < la || j < lb; {
 		switch true {
 		case i == la:
 			c = append(c, b[j:]...)
+			wc = append(wc, wb[j:]...)
 			break loop
 		case j == lb:
 			c = append(c, a[i:]...)
+			wc = append(wc, wa[i:]...)
 			break loop
 		case a[i] < b[j]:
 			c = append(c, a[i])
+			wc = append(wc, wa[i])
 			i++
 		case a[i] > b[j]:
 			c = append(c, b[j])
+			wc = append(wc, wb[j])
 			j++
 		default:
 			c = append(c, a[i])
+			wc = append(wc, wa[i])
 			i++
 			j++
 		}
 	}
-
-	return c
+	return c, wc
 }
 
-func makeTreeProps(bs []Bucket, n []uint32) Bucket {
+func makeTreeProps(bs []Bucket, n []uint32, w []uint64) Bucket {
 	bs[0].nodes = n
+	bs[0].weights = w
 	for i := len(bs) - 1; i > 0; i-- {
 		bs[i].nodes = n
+		bs[i].weights = w
 		bs[i-1].children = []Bucket{bs[i]}
 	}
 	return bs[0]

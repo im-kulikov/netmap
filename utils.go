@@ -1,5 +1,26 @@
 package netmap
 
+import (
+	"sort"
+)
+
+type nw struct {
+	n []uint32
+	w []uint64
+}
+
+func (f nw) Len() int { return len(f.n) }
+func (f nw) Swap(i, j int) {
+	f.n[i], f.n[j] = f.n[j], f.n[i]
+	f.w[i], f.w[j] = f.w[j], f.w[i]
+}
+func (f nw) Less(i, j int) bool {
+	return f.n[i] < f.n[j]
+}
+func (f nw) Load() ([]uint32, []uint64) {
+	return f.n, f.w
+}
+
 func getNodes(b Bucket, path []Bucket) (nodes []uint32) {
 	if len(path) == 0 {
 		return b.Nodelist()
@@ -48,11 +69,14 @@ func intersect(a, b []uint32) []uint32 {
 	return c
 }
 
-func diff(a []uint32, b map[uint32]struct{}) (c []uint32) {
+func diff(a []uint32, b map[uint32]struct{}, w []uint64) (c []uint32, d []uint64) {
 	c = make([]uint32, 0, len(a))
-	for _, e := range a {
+	d = make([]uint64, 0, len(a))
+	for i, e := range a {
 		if _, ok := b[e]; !ok {
 			c = append(c, e)
+			d = append(d, w[i])
+
 		}
 	}
 	return
@@ -101,4 +125,10 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func strawSort(a []uint32, b []uint64) {
+	s := nw{a, b}
+	sort.Sort(s)
+	a, b = s.Load()
 }
